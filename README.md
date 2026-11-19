@@ -4,6 +4,12 @@ The 3.5inch RPi Display (ILI9486, 480 x 320, RGB565, with an XPT2046 touch panel
 [atomvm-tang25k-hls](https://github.com/elixir-hls/atomvm-tang25k-hls) (with [elixir-hls](https://github.com/elixir-hls/elixir-hls)): a SoC
 peripheral (SPI master, DC / RST, PENIRQ) and its NIFs.
 
+In the application's mix.exs, beside its target:
+
+```elixir
+{:atomvm_tang25k_rpi_display_35inch, "~> 0.1"}
+```
+
 ```elixir
 use EHLS, blocks: [EHLS.RPiDisplay35], peripherals: [:lcd]
 
