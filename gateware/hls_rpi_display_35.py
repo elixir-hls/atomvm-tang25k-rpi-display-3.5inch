@@ -9,7 +9,6 @@ panel up after reset; its clients:
                SCLK divider, init, status), driven by the :lcd NIFs (src/lcd_nif.c)
   lcd_ops      sink: ops (u32), as lcd_engine.py documents them; a transaction ends with `last`
   lcd_pixels   sink: RGB565 pixels (u16) into the window x, y, w, h, row by row (a row a transaction)
-  lcd_columns  sink: {col, cur, lo, hi} (u16 each), a graph of columns (lcd_columns.py)
 
 Default pins: PMOD J6 of the Sipeed Tang Primer 25K Dock, as in usb-rtl-sdr-tang25k
 (LiteX j6 index -> Dock pin: 0..3 = pins 11, 9, 7, 5; 4..7 = pins 12, 10, 8, 6); an
@@ -23,7 +22,6 @@ from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import CSRStatus, CSRStorage, CSRField
 
 import lcd_engine as e
-import lcd_columns
 
 # signal -> LiteX connector pin(s)
 PINS = {
@@ -72,7 +70,6 @@ def add_to_soc(soc):
     pads = _Pads(soc.platform.request("lcd_spi"), soc.platform.request("lcd_ctl"))
     soc.lcd_engine = e.LCDEngine(soc.sys_clk_freq, pads)
     soc.lcd_engine.penirq = soc.platform.request("lcd_irq")
-    lcd_columns.add_registers(soc)       # lcd_columns' CSRs (EHLS.RPiDisplay35 registers)
 
 
 class CPUPort(LiteXModule):
@@ -178,5 +175,5 @@ class LCDPixels(LiteXModule):
         soc.lcd_engine.add_client(ep)
 
 
-BLOCKS = {"lcd_ops": LCDOps, "lcd_pixels": LCDPixels, "lcd_columns": lcd_columns.LCDColumns}
+BLOCKS = {"lcd_ops": LCDOps, "lcd_pixels": LCDPixels}
 PERIPHERALS = {"lcd": add_lcd}

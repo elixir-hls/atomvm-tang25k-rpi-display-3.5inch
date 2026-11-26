@@ -39,8 +39,8 @@ The CPU's calls put ops into the engine's FIFO (512) and return: `fill` is 4 ops
 ```elixir
 use EHLS, blocks: [EHLS.RPiDisplay35]
 
-definstance spectrum do
-  ... |> lcd_columns(0, 24, 480, 256)
+definstance picture do
+  ... |> lcd_pixels(0, 0, 480, 320)
 end
 ```
 
@@ -48,13 +48,9 @@ end
 |---|---|---|
 | `lcd_ops()` | `u32` | ops, as the CPU sends them |
 | `lcd_pixels(x, y, w, h)` | `u16` | RGB565 pixels into the window, row by row (a row a transaction) |
-| `lcd_columns(x, y, w, h)` | `{col, cur, lo, hi}` | a graph of columns (a spectrum): rows from the bottom; bit 15 of `col` ends a frame |
 
-`lcd_columns` keeps what each column shows and sends only the part that changed (a window one
-column wide, then its pixels): the trace joined to the column on its left, the band `lo..hi`, a
-fill under the trace, a grid. Three buffers: a frame that comes while another waits replaces it,
-so the stream never waits. Its colours, the fill, the grid's rows and columns are registers (see
-`EHLS.RPiDisplay35`), and so are the frames drawn and replaced.
+What is drawn and how (a graph, a widget) belongs to the application: its `defhls` functions
+give ops to `lcd_ops()` or pixels to `lcd_pixels`.
 
 A stopped `definstance` ends the transaction its sink is in, so the display is not held.
 
@@ -81,7 +77,7 @@ Other pins: `use EHLS, blocks: [{EHLS.RPiDisplay35, pins: [dc: "j6:0", ...]}]`. 
 32 steps) for checking the gamma; it runs on any SoC with `:lcd`.
 
 `sim/`: simulations of the engine and its clients with a model of the panel
-(`python3 sim/test_engine.py`, `test_clients.py`, `test_columns.py`; migen and LiteX).
+(`python3 sim/test_engine.py`, `test_clients.py`; migen and LiteX).
 
 From usb-rtl-sdr-tang25k (driver) and usb-rtl-sdr-tv (gamma).
 
