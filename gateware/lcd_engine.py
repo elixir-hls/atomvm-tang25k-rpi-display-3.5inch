@@ -196,6 +196,7 @@ class LCDEngine(LiteXModule):
         self.ready = Signal()
         self.epoch = Signal()
         self.idle = Signal()
+        self.granted, self.owner = Signal(), Signal(8)     # a transaction in progress, its client
         self.init = InitROM(init if init is not None else init_ops())
         self.touch = stream.SyncFIFO([("data", 12)], 16)
         self.sclk, self.mosi, self.miso = Signal(), Signal(), Signal()
@@ -220,7 +221,8 @@ class LCDEngine(LiteXModule):
         op_valid, op_ready, op_data = Signal(), Signal(), Signal(32)
         valids = Array(c.valid for c in clients)
         datas = Array(c.data for c in clients)
-        self.comb += [op_valid.eq(granted & valids[idx]), op_data.eq(datas[idx])]
+        self.comb += [op_valid.eq(granted & valids[idx]), op_data.eq(datas[idx]),
+                      self.granted.eq(granted), self.owner.eq(idx)]
         for i, c in enumerate(clients):
             self.comb += c.ready.eq(granted & (idx == i) & op_ready)
         # the next client: 0 if it has ops, else the first with ops from rr on (the others only once ready)

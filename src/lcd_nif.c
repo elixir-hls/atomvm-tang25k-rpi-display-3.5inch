@@ -1,26 +1,30 @@
-/* Built only when the SoC has the LCD (lcd_csr.h, csr_headers.json). */
+/* Built only when the SoC has the LCD's CPU port (lcd_csr.h, csr_headers.json). */
 #if __has_include("lcd_csr.h")
 /*
- * NIFs for the 3.5inch RPi Display (ILI9486, 480 x 320, RGB565) and its XPT2046 touch panel
- * (gateware/hls_rpi_display_35.py: lcd_spi, lcd_ctl, lcd_irq). From usb-rtl-sdr-tang25k's
- * apps/sdr/src/lcd.c (protocol and touch calibration: its docs/lcd.md).
+ * NIFs for the 3.5inch RPi Display (ILI9486, 480 x 320, RGB565) and its XPT2046 touch panel, on the
+ * CPU's port of the drawing engine (gateware/hls_rpi_display_35.py CPUPort, gateware/lcd_engine.py):
+ * a call puts ops into the engine's FIFO (512) and returns; it waits only while the FIFO is full.
  *
  *   lcd:init() -> ok
- *       Reset and set up the panel (landscape), clear it to black (~0.6 s).
+ *       The panel set up again and cleared to black (the engine does it after reset too); returns
+ *       once it is done (~0.5 s).
  *   lcd:fill(X, Y, W, H, Color) -> ok
- *       A rectangle in RGB565.
+ *       A rectangle in RGB565 (4 ops).
  *   lcd:text(X, Y, Text :: binary(), Fg, Bg, Scale) -> NextX
  *       Text in the 16 x 32 Terminus font (ASCII 32..126, others as '?'), each pixel
  *       Scale x Scale; stops at the right edge. Returns the x after the text.
  *   lcd:touch() -> {X, Y} | false
  *       The screen position while the panel is pressed (median of 5 samples), else false.
+ *   lcd:wait() -> ok
+ *       Until the CPU's ops are all out.
+ *   lcd:ops([Op]) -> ok
+ *       Any ops (32-bit integers, as lcd_engine.py documents them); the last should end the
+ *       transaction (bit 27), as the other clients wait until it does.
+ *   lcd:clock(Div) -> ok
+ *       The LCD's SCLK divider (>= 2): 3 by default (16.7 MHz at 50 MHz), 2 for 25 MHz.
  *
- * The SPI master is polled: a call holds the CPU while its pixels go out (a 16 x 32
- * character ~1 ms, the whole screen ~0.25 s at ~12.5 MHz).
- *
- * ILI9486 on this board: every command and parameter byte goes out as a 16-bit word (0x00, v);
- * pixels are RGB565, two per 32-bit transfer. XPT2046: 24-bit transfers (command, 16 bits
- * back, value = bits [15:3]) at ~1.6 MHz.
+ * A transaction (a rectangle, a character, a touch reading) goes out whole; the sinks of a
+ * pipeline draw between them.
  */
 #include <stdint.h>
 #include <string.h>
@@ -41,86 +45,36 @@
 #define LCD_W 480
 #define LCD_H 320
 
-#define SPI_START BIT(0)
-#define SPI_DONE BIT(0)
-#define CS_MANUAL BIT(16)
-#define CS_LCD BIT(0)
-#define CS_TOUCH BIT(1)
-#define DIV_LCD 4
-#define DIV_TOUCH 32
-#define CTL_DC BIT(0)
-#define CTL_RST BIT(1)
+#define ST_READY BIT(0)
+#define ST_IDLE BIT(1)
+#define ST_PENIRQ BIT(2)
+#define TOUCH_VALID BIT(16)
 
-static uint32_t ctl = CTL_RST;
+/* the ops (gateware/lcd_engine.py) */
+enum { OP_CMD = 1, OP_DATA, OP_COLS, OP_ROWS, OP_FG, OP_BG, OP_FILL, OP_BITS, OP_WAIT, OP_RST, OP_TOUCH };
+#define LAST BIT(27)
+#define OP(code, payload) (((uint32_t) (code) << 28) | (uint32_t) (payload))
 
-static uint32_t spi_xfer(int bits, uint32_t data)
+static uint32_t room;
+
+static void push(uint32_t op)
 {
-    sys_write32(data, CSR_LCD_SPI_MOSI_ADDR);
-    sys_write32(SPI_START | ((uint32_t) bits << 8), CSR_LCD_SPI_CONTROL_ADDR);
-    while (!(sys_read32(CSR_LCD_SPI_STATUS_ADDR) & SPI_DONE)) {
+    while (room == 0) {
+        room = sys_read32(CSR_LCD_ROOM_ADDR);
     }
-    return sys_read32(CSR_LCD_SPI_MISO_ADDR);
+    sys_write32(op, CSR_LCD_OP_ADDR);
+    room--;
 }
 
-static void dc(int data)
+/* the window [x, x + w) x [y, y + h): pixels follow */
+static void window(int x, int y, int w, int h)
 {
-    ctl = data ? (ctl | CTL_DC) : (ctl & ~CTL_DC);
-    sys_write32(ctl, CSR_LCD_CTL_OUT_ADDR);
-}
-
-static void lcd_select(int on)
-{
-    sys_write32(CS_MANUAL | (on ? CS_LCD : 0u), CSR_LCD_SPI_CS_ADDR);
-}
-
-static void lcd_cmd(uint8_t c, const uint8_t *p, int n)
-{
-    dc(0);
-    spi_xfer(16, c);
-    dc(1);
-    for (int i = 0; i < n; i++) {
-        spi_xfer(16, p[i]);
-    }
-}
-
-/* address window [x, x + w) x [y, y + h), then memory write: pixels follow */
-static void lcd_window(int x, int y, int w, int h)
-{
-    uint8_t col[4] = { x >> 8, x & 0xff, (x + w - 1) >> 8, (x + w - 1) & 0xff };
-    uint8_t row[4] = { y >> 8, y & 0xff, (y + h - 1) >> 8, (y + h - 1) & 0xff };
-
-    lcd_cmd(0x2a, col, 4);
-    lcd_cmd(0x2b, row, 4);
-    lcd_cmd(0x2c, NULL, 0);
-}
-
-/* pixels, two per 32-bit transfer */
-static uint16_t pend;
-static int npend;
-
-static void px(uint16_t c)
-{
-    if (npend) {
-        spi_xfer(32, ((uint32_t) pend << 16) | c);
-        npend = 0;
-    } else {
-        pend = c;
-        npend = 1;
-    }
-}
-
-static void px_flush(void)
-{
-    if (npend) {
-        spi_xfer(16, pend);
-        npend = 0;
-    }
+    push(OP(OP_COLS, ((uint32_t) x << 9) | (uint32_t) (x + w - 1)));
+    push(OP(OP_ROWS, ((uint32_t) y << 9) | (uint32_t) (y + h - 1)));
 }
 
 static void lcd_fill(int x, int y, int w, int h, uint16_t color)
 {
-    uint32_t pair = ((uint32_t) color << 16) | color;
-
     /* clip to the screen */
     if (x < 0) {
         w += x;
@@ -135,33 +89,16 @@ static void lcd_fill(int x, int y, int w, int h, uint16_t color)
     if (w <= 0 || h <= 0) {
         return;
     }
-    int n = w * h;
-    sys_write32(DIV_LCD, CSR_LCD_SPI_CLK_DIVIDER_ADDR);
-    lcd_select(1);
-    lcd_window(x, y, w, h);
-    for (; n >= 2; n -= 2) {
-        spi_xfer(32, pair);
-    }
-    if (n) {
-        spi_xfer(16, color);
-    }
-    lcd_select(0);
+    window(x, y, w, h);
+    push(OP(OP_FG, color));
+    push(OP(OP_FILL, (uint32_t) (w * h)) | LAST);
 }
 
-/* power and gamma (the Linux waveshare35a overlay's values; without them a grey ramp jumps) */
-static void lcd_gamma_init(void)
+static void wait_idle(void)
 {
-    static const uint8_t pwr3 = 0x44, vcom[4] = { 0, 0, 0, 0 };
-    static const uint8_t pg[15] = { 0x0f, 0x1f, 0x1c, 0x0c, 0x0f, 0x08, 0x48, 0x98, 0x37, 0x0a, 0x13,
-        0x04, 0x11, 0x0d, 0x00 };
-    static const uint8_t ng[15] = { 0x0f, 0x32, 0x2e, 0x0b, 0x0d, 0x05, 0x47, 0x75, 0x37, 0x06, 0x10,
-        0x03, 0x24, 0x20, 0x00 };
-
-    lcd_cmd(0xc2, &pwr3, 1);
-    lcd_cmd(0xc5, vcom, 4);
-    lcd_cmd(0xe0, pg, 15);
-    lcd_cmd(0xe1, ng, 15);
-    lcd_cmd(0xe2, ng, 15);
+    while (!(sys_read32(CSR_LCD_STATUS_ADDR) & ST_IDLE)) {
+        k_yield();
+    }
 }
 
 static term nif_lcd_init(Context *ctx, int argc, term argv[])
@@ -169,27 +106,11 @@ static term nif_lcd_init(Context *ctx, int argc, term argv[])
     UNUSED(ctx);
     UNUSED(argc);
     UNUSED(argv);
-    static const uint8_t pixfmt = 0x55, madctl = 0x28;
-
-    sys_write32(DIV_LCD, CSR_LCD_SPI_CLK_DIVIDER_ADDR);
-    lcd_select(0);
-    ctl = 0; /* hardware reset pulse */
-    sys_write32(ctl, CSR_LCD_CTL_OUT_ADDR);
-    k_msleep(20);
-    ctl = CTL_RST;
-    sys_write32(ctl, CSR_LCD_CTL_OUT_ADDR);
-    k_msleep(150);
-    lcd_select(1);
-    lcd_cmd(0x01, NULL, 0); /* software reset */
-    k_msleep(150);
-    lcd_cmd(0x11, NULL, 0); /* sleep out */
-    k_msleep(150);
-    lcd_cmd(0x3a, &pixfmt, 1); /* 16 bit / pixel */
-    lcd_cmd(0x36, &madctl, 1); /* landscape */
-    lcd_gamma_init();
-    lcd_cmd(0x29, NULL, 0); /* display on */
-    lcd_select(0);
-    lcd_fill(0, 0, LCD_W, LCD_H, 0);
+    wait_idle();
+    sys_write32(1, CSR_LCD_INIT_ADDR);
+    while (!(sys_read32(CSR_LCD_STATUS_ADDR) & ST_READY)) {
+        k_msleep(1);
+    }
     return OK_ATOM;
 }
 
@@ -216,37 +137,72 @@ static term nif_lcd_text(Context *ctx, int argc, term argv[])
     int x = term_to_int(argv[0]), y = term_to_int(argv[1]);
     const uint8_t *s = (const uint8_t *) term_binary_data(argv[2]);
     size_t len = term_binary_size(argv[2]);
-    uint16_t fg = (uint16_t) term_to_int(argv[3]), bg = (uint16_t) term_to_int(argv[4]);
+    uint16_t fgc = (uint16_t) term_to_int(argv[3]), bgc = (uint16_t) term_to_int(argv[4]);
     int scale = term_to_int(argv[5]);
     if (scale < 1 || scale > 8 || x < 0 || y < 0 || y + FONT_H * scale > LCD_H) {
         RAISE_ERROR(BADARG_ATOM);
     }
 
-    sys_write32(DIV_LCD, CSR_LCD_SPI_CLK_DIVIDER_ADDR);
-    lcd_select(1);
     for (size_t i = 0; i < len && x + FONT_W * scale <= LCD_W; i++, x += FONT_W * scale) {
         int c = (s[i] < FONT_FIRST || s[i] > FONT_LAST) ? '?' : s[i];
         const uint8_t *g = font_bits[c - FONT_FIRST];
 
-        lcd_window(x, y, FONT_W * scale, FONT_H * scale);
+        /* a character a transaction: its window, the colours, a BITS op every 16 pixels */
+        window(x, y, FONT_W * scale, FONT_H * scale);
+        push(OP(OP_FG, fgc));
+        push(OP(OP_BG, bgc));
         for (int r = 0; r < FONT_H * scale; r++) {
             const uint8_t *row = g + (r / scale) * FONT_ROW_BYTES;
+            uint32_t bits = 0;
+            int n = 0;
 
             for (int col = 0; col < FONT_W * scale; col++) {
                 int b = col / scale;
 
-                px((row[b >> 3] & (0x80 >> (b & 7))) ? fg : bg);
+                bits = (bits << 1) | ((row[b >> 3] & (0x80 >> (b & 7))) ? 1u : 0u);
+                if (++n == 16) {
+                    int end = (r == FONT_H * scale - 1) && (col == FONT_W * scale - 1);
+
+                    push(OP(OP_BITS, (15u << 16) | bits) | (end ? LAST : 0));
+                    bits = 0;
+                    n = 0;
+                }
             }
         }
-        px_flush();
     }
-    lcd_select(0);
     return term_from_int(x);
 }
 
-static int touch_cmd(uint8_t c)
+/* a touch reading, one transaction: Z1, X and Y five times, then PD = 00 (PENIRQ enabled again) */
+static int touch_read(int *z1, int *rx, int *ry)
 {
-    return (spi_xfer(24, (uint32_t) c << 16) & 0xffff) >> 3;
+    int v[12];
+
+    push(OP(OP_TOUCH, 0xb1));
+    for (int i = 0; i < 5; i++) {
+        push(OP(OP_TOUCH, 0xd1));
+        push(OP(OP_TOUCH, 0x91));
+    }
+    push(OP(OP_TOUCH, 0x90) | LAST);
+    for (int i = 0; i < 12; i++) {
+        uint32_t t;
+        int64_t start = k_uptime_get();
+
+        while (!((t = sys_read32(CSR_LCD_TOUCH_ADDR)) & TOUCH_VALID)) {
+            if (k_uptime_get() - start > 100) {
+                return -1;
+            }
+            k_yield();
+        }
+        sys_write32(1, CSR_LCD_TOUCH_POP_ADDR);
+        v[i] = (int) (t & 0xfff);
+    }
+    *z1 = v[0];
+    for (int i = 0; i < 5; i++) {
+        rx[i] = v[1 + 2 * i];
+        ry[i] = v[2 + 2 * i];
+    }
+    return 0;
 }
 
 static int median5(int *v)
@@ -268,20 +224,11 @@ static term nif_lcd_touch(Context *ctx, int argc, term argv[])
     UNUSED(argv);
     int rx[5], ry[5], z1;
 
-    if (sys_read32(CSR_LCD_IRQ_IN_ADDR) & 1) {
+    if (sys_read32(CSR_LCD_STATUS_ADDR) & ST_PENIRQ) {
         return FALSE_ATOM; /* PENIRQ high: not pressed */
     }
-    sys_write32(DIV_TOUCH, CSR_LCD_SPI_CLK_DIVIDER_ADDR);
-    sys_write32(CS_MANUAL | CS_TOUCH, CSR_LCD_SPI_CS_ADDR);
-    z1 = touch_cmd(0xb1);
-    for (int i = 0; i < 5; i++) {
-        rx[i] = touch_cmd(0xd1);
-        ry[i] = touch_cmd(0x91);
-    }
-    touch_cmd(0x90); /* PD = 00: PENIRQ enabled again */
-    sys_write32(CS_MANUAL, CSR_LCD_SPI_CS_ADDR);
-    if (z1 < 80) {
-        return FALSE_ATOM; /* too light: the position is not reliable */
+    if (touch_read(&z1, rx, ry) < 0 || z1 < 80) {
+        return FALSE_ATOM; /* no answer, or too light: the position is not reliable */
     }
     /* calibration (usb-rtl-sdr-tang25k docs/lcd.md): screen x follows raw Y reversed, y raw X */
     int x = CLAMP(40 + (3610 - median5(ry)) * 400 / 3110, 0, LCD_W - 1);
@@ -296,10 +243,57 @@ static term nif_lcd_touch(Context *ctx, int argc, term argv[])
     return t;
 }
 
+static term nif_lcd_wait(Context *ctx, int argc, term argv[])
+{
+    UNUSED(ctx);
+    UNUSED(argc);
+    UNUSED(argv);
+    wait_idle();
+    return OK_ATOM;
+}
+
+static term nif_lcd_ops(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    term l = argv[0];
+    VALIDATE_VALUE(l, term_is_list);
+    /* all checked first: a bad element must not leave a transaction open */
+    for (term t = l; term_is_nonempty_list(t); t = term_get_list_tail(t)) {
+        term h = term_get_list_head(t);
+        if (!term_is_any_integer(h)) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        avm_int64_t v = term_maybe_unbox_int64(h);
+        if (v < 0 || v > 0xffffffffLL) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+    }
+    for (term t = l; term_is_nonempty_list(t); t = term_get_list_tail(t)) {
+        push((uint32_t) term_maybe_unbox_int64(term_get_list_head(t)));
+    }
+    return OK_ATOM;
+}
+
+static term nif_lcd_clock(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    VALIDATE_VALUE(argv[0], term_is_integer);
+    int d = term_to_int(argv[0]);
+    if (d < 2 || d > 255) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+    wait_idle();
+    sys_write32((uint32_t) d, CSR_LCD_DIV_ADDR);
+    return OK_ATOM;
+}
+
 static const struct Nif lcd_init_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_init };
 static const struct Nif lcd_fill_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_fill };
 static const struct Nif lcd_text_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_text };
 static const struct Nif lcd_touch_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_touch };
+static const struct Nif lcd_wait_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_wait };
+static const struct Nif lcd_ops_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_ops };
+static const struct Nif lcd_clock_nif = { .base.type = NIFFunctionType, .nif_ptr = nif_lcd_clock };
 
 static const struct Nif *lcd_get_nif(const char *nifname)
 {
@@ -314,6 +308,15 @@ static const struct Nif *lcd_get_nif(const char *nifname)
     }
     if (strcmp("lcd:touch/0", nifname) == 0) {
         return &lcd_touch_nif;
+    }
+    if (strcmp("lcd:wait/0", nifname) == 0) {
+        return &lcd_wait_nif;
+    }
+    if (strcmp("lcd:ops/1", nifname) == 0) {
+        return &lcd_ops_nif;
+    }
+    if (strcmp("lcd:clock/1", nifname) == 0) {
+        return &lcd_clock_nif;
     }
     return NULL;
 }
