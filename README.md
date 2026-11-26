@@ -1,8 +1,8 @@
 # atomvm-tang25k-rpi-display-3.5inch
 
 The 3.5inch RPi Display (ILI9486, 480 x 320, RGB565, with an XPT2046 touch panel) for
-[atomvm-tang25k-hls](https://github.com/elixir-hls/atomvm-tang25k-hls) (with [elixir-hls](https://github.com/elixir-hls/elixir-hls)): a SoC
-peripheral (SPI master, DC / RST, PENIRQ) and its NIFs.
+[atomvm-tang25k-hls](https://github.com/elixir-hls/atomvm-tang25k-hls) (with [elixir-hls](https://github.com/elixir-hls/elixir-hls)): a drawing
+engine in the FPGA, the CPU's NIFs on it, and sinks a `definstance` draws with.
 
 In the application's mix.exs, beside its target:
 
@@ -13,15 +13,50 @@ In the application's mix.exs, beside its target:
 ```elixir
 use EHLS, blocks: [EHLS.RPiDisplay35], peripherals: [:lcd]
 
-:lcd.init()                              # reset, landscape, power / gamma registers, black
 :lcd.fill(x, y, w, h, rgb565)
 :lcd.text(x, y, "82.5", fg, bg, scale)   # 16 x 32 Terminus font; returns the x after it
 :lcd.touch()                             # {x, y} while pressed, else false
+:lcd.wait()                              # until the CPU's ops are all out
+:lcd.clock(2)                            # the LCD's SCLK: sys / 2 (3 by default: 16.7 MHz)
+:lcd.init()                              # the set-up again (the engine does it after reset)
 ```
 
-The pixels go out from C (src/lcd_nif.c, polled SPI at ~12.5 MHz: a 16 x 32 character
-~1 ms, the whole screen ~0.25 s); the touch is read at ~1.5 MHz, the median of 5 samples,
-calibrated for this panel. Power and gamma registers as the Linux waveshare35a overlay.
+## The engine
+
+The engine (gateware/lcd_engine.py) owns the display's pins. After reset it sets the panel up
+from a ROM (reset, landscape, 16-bit pixels, power and gamma registers as the Linux waveshare35a
+overlay, black), then runs ops from its clients, a transaction at a time: the CPU and the sinks
+below. An op is a 32-bit word: a command, a parameter or pixel, a window (`COLS`, `ROWS`), colours,
+`FILL` (n pixels of one colour), `BITS` (up to 16 pixels of two colours: a row of a glyph), a wait,
+the reset pin, a touch transfer; bit 27 ends the transaction. The LCD's SCLK is sys / 3 (16.7 MHz
+at 50 MHz), with no gap between words; the touch's sys / 32.
+
+The CPU's calls put ops into the engine's FIFO (512) and return: `fill` is 4 ops, a character of
+`text` 36 at scale 1; the CPU waits only while the FIFO is full. `:lcd.ops/1` sends any ops.
+
+## Sinks
+
+```elixir
+use EHLS, blocks: [EHLS.RPiDisplay35]
+
+definstance spectrum do
+  ... |> lcd_columns(0, 24, 480, 256)
+end
+```
+
+| Block | Element | |
+|---|---|---|
+| `lcd_ops()` | `u32` | ops, as the CPU sends them |
+| `lcd_pixels(x, y, w, h)` | `u16` | RGB565 pixels into the window, row by row (a row a transaction) |
+| `lcd_columns(x, y, w, h)` | `{col, cur, lo, hi}` | a graph of columns (a spectrum): rows from the bottom; bit 15 of `col` ends a frame |
+
+`lcd_columns` keeps what each column shows and sends only the part that changed (a window one
+column wide, then its pixels): the trace joined to the column on its left, the band `lo..hi`, a
+fill under the trace, a grid. Three buffers: a frame that comes while another waits replaces it,
+so the stream never waits. Its colours, the fill, the grid's rows and columns are registers (see
+`EHLS.RPiDisplay35`), and so are the frames drawn and replaced.
+
+A stopped `definstance` ends the transaction its sink is in, so the display is not held.
 
 ## Pins
 
@@ -44,6 +79,9 @@ Other pins: `use EHLS, blocks: [{EHLS.RPiDisplay35, pins: [dc: "j6:0", ...]}]`. 
 
 `examples/lcd_bars.ex`: the test pattern (8 colour bars, grey / red / green / blue ramps in
 32 steps) for checking the gamma; it runs on any SoC with `:lcd`.
+
+`sim/`: simulations of the engine and its clients with a model of the panel
+(`python3 sim/test_engine.py`, `test_clients.py`, `test_columns.py`; migen and LiteX).
 
 From usb-rtl-sdr-tang25k (driver) and usb-rtl-sdr-tv (gamma).
 

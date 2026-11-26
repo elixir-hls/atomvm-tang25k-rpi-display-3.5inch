@@ -23,6 +23,7 @@ from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import CSRStatus, CSRStorage, CSRField
 
 import lcd_engine as e
+import lcd_columns
 
 # signal -> LiteX connector pin(s)
 PINS = {
@@ -71,6 +72,7 @@ def add_to_soc(soc):
     pads = _Pads(soc.platform.request("lcd_spi"), soc.platform.request("lcd_ctl"))
     soc.lcd_engine = e.LCDEngine(soc.sys_clk_freq, pads)
     soc.lcd_engine.penirq = soc.platform.request("lcd_irq")
+    lcd_columns.add_registers(soc)       # lcd_columns' CSRs (EHLS.RPiDisplay35 registers)
 
 
 class CPUPort(LiteXModule):
@@ -176,10 +178,5 @@ class LCDPixels(LiteXModule):
         soc.lcd_engine.add_client(ep)
 
 
-def _columns(soc, enable, x, y, w, h):
-    import lcd_columns
-    return lcd_columns.LCDColumns(soc, enable, x, y, w, h)
-
-
-BLOCKS = {"lcd_ops": LCDOps, "lcd_pixels": LCDPixels, "lcd_columns": _columns}
+BLOCKS = {"lcd_ops": LCDOps, "lcd_pixels": LCDPixels, "lcd_columns": lcd_columns.LCDColumns}
 PERIPHERALS = {"lcd": add_lcd}
