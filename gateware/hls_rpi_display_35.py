@@ -139,7 +139,9 @@ class LCDPixels(LiteXModule):
     """Sink: RGB565 pixels (u16) into the window x, y, w, h, row by row; each row one transaction
     (its window, then its w pixels), so that other clients draw in between; after the last row the
     first again; a row starts once its first pixel is there (the display is not held waiting for one). Stopped, it
-    ends the row it is in with black and starts again at the first, even if started again before that row is out."""
+    ends the row it is in with black and starts again at the first, even if started again before that row is out. A
+    producer that stalls inside a row (its instance running) holds the display until the row's pixels are in: a row is
+    one transaction."""
     def __init__(self, soc, enable, x, y, w, h):
         if not (0 <= x and 0 < w and x + w <= e.W and 0 <= y and 0 < h and y + h <= e.H):
             raise SystemExit(f"lcd_pixels({x}, {y}, {w}, {h}): outside the {e.W} x {e.H} screen")
