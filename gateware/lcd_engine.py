@@ -237,9 +237,14 @@ class LCDEngine(LiteXModule):
             cond = (cand != 0) & valids[cand] & self.ready
             sel = If(cond, pick.eq(cand), any_.eq(1)) if sel is None else If(cond, pick.eq(cand), any_.eq(1)).Else(sel)
         self.comb += If(clients[0].valid, pick.eq(0), any_.eq(1)).Else(sel)
+        # a client granted that offers no op before its first is taken (its valid dropped in the clock between the
+        # pick and the grant: an instance stopped) is passed over: the grant goes back
+        started = Signal()
         self.sync += [
             If(~granted & any_, granted.eq(1), idx.eq(pick)),
-            If(done_txn, granted.eq(0), rr.eq(Mux(idx == n - 1, 0, idx + 1))),
+            If(op_valid & op_ready, started.eq(1)),
+            If(granted & ~started & ~valids[idx], granted.eq(0), rr.eq(Mux(idx == n - 1, 0, idx + 1))),
+            If(done_txn, granted.eq(0), started.eq(0), rr.eq(Mux(idx == n - 1, 0, idx + 1))),
         ]
 
         # the sequencer: an op into words

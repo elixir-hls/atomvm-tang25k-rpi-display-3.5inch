@@ -100,7 +100,8 @@ class CPUPort(LiteXModule):
         self.comb += [
             fifo.sink.valid.eq(self.op.re),
             fifo.sink.data.eq(self.op.storage),
-            self.room.status.eq(self.DEPTH - fifo.level),
+            # (the buffered FIFO holds one more than DEPTH: room 0 then too)
+            self.room.status.eq(Mux(fifo.level >= self.DEPTH, 0, self.DEPTH - fifo.level)),
             self.status.fields.ready.eq(engine.ready),
             self.status.fields.idle.eq(~fifo.source.valid & ~(engine.granted & (engine.owner == me))),
             self.status.fields.penirq.eq(penirq),
@@ -137,7 +138,8 @@ class LCDOps(LiteXModule):
 class LCDPixels(LiteXModule):
     """Sink: RGB565 pixels (u16) into the window x, y, w, h, row by row; each row one transaction
     (its window, then its w pixels), so that other clients draw in between; after the last row the
-    first again. Stopped, it ends the row it is in with black and starts again at the first."""
+    first again; a row starts once its first pixel is there (the display is not held waiting for one). Stopped, it
+    ends the row it is in with black and starts again at the first, even if started again before that row is out."""
     def __init__(self, soc, enable, x, y, w, h):
         if not (0 <= x and 0 < w and x + w <= e.W and 0 <= y and 0 < h and y + h <= e.H):
             raise SystemExit(f"lcd_pixels({x}, {y}, {w}, {h}): outside the {e.W} x {e.H} screen")
@@ -147,27 +149,34 @@ class LCDPixels(LiteXModule):
         step = Signal(2)             # 0 COLS, 1 ROWS, 2 pixels
         yrow = Signal(9)
         last_px = Signal()
+        stopped = Signal()           # stopped inside a row: it is ended with black, then the first row again
+        pad = Signal()
         self.comb += [
             yrow.eq(y + row),
             last_px.eq(col == w - 1),
+            pad.eq(~enable | stopped),
             If(step == 0,
-                ep.valid.eq(enable), ep.data.eq(e.cols(x, x + w - 1)),
+                ep.valid.eq(enable & self.sink.valid), ep.data.eq(e.cols(x, x + w - 1)),
             ).Elif(step == 1,
                 ep.valid.eq(1), ep.data.eq((e.OP_ROWS << 28) | (yrow << 9) | yrow),
             ).Else(
-                ep.valid.eq(self.sink.valid | ~enable),
-                ep.data.eq((e.OP_DATA << 28) | (last_px << 27) | Mux(enable, self.sink.data[:16], 0)),
-                self.sink.ready.eq(ep.ready & enable),
+                ep.valid.eq(self.sink.valid | pad),
+                ep.data.eq((e.OP_DATA << 28) | (last_px << 27) | Mux(pad, 0, self.sink.data[:16])),
+                self.sink.ready.eq(ep.ready & ~pad),
             ),
             If(~enable, self.sink.ready.eq(1)),
         ]
         self.sync += [
+            If(~enable & (step != 0), stopped.eq(1)),
             If(ep.valid & ep.ready,
                 If(step == 0, step.eq(1)
                 ).Elif(step == 1, step.eq(2), col.eq(0)
                 ).Else(
                     col.eq(col + 1),
-                    If(last_px, step.eq(0), row.eq(Mux(row == h - 1, 0, row + 1))),
+                    If(last_px,
+                        step.eq(0),
+                        If(pad, row.eq(0), stopped.eq(0)).Else(row.eq(Mux(row == h - 1, 0, row + 1))),
+                    ),
                 ),
             ),
             If(~enable & (step == 0), row.eq(0)),

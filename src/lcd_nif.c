@@ -178,6 +178,11 @@ static int touch_read(int *z1, int *rx, int *ry)
 {
     int v[12];
 
+    /* the ops before it out (their time is not the touch's), values left by a reading that timed out dropped */
+    wait_idle();
+    while (sys_read32(CSR_LCD_TOUCH_ADDR) & TOUCH_VALID) {
+        sys_write32(1, CSR_LCD_TOUCH_POP_ADDR);
+    }
     push(OP(OP_TOUCH, 0xb1));
     for (int i = 0; i < 5; i++) {
         push(OP(OP_TOUCH, 0xd1));
@@ -260,7 +265,8 @@ static term nif_lcd_ops(Context *ctx, int argc, term argv[])
     /* all checked first: a bad element must not leave a transaction open */
     for (term t = l; term_is_nonempty_list(t); t = term_get_list_tail(t)) {
         term h = term_get_list_head(t);
-        if (!term_is_any_integer(h)) {
+        /* (an integer over 64 bits is no op: term_maybe_unbox_int64 would read its low bits) */
+        if (!term_is_int64(h)) {
             RAISE_ERROR(BADARG_ATOM);
         }
         avm_int64_t v = term_maybe_unbox_int64(h);

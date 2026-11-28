@@ -77,7 +77,8 @@ Other pins: `use EHLS, blocks: [{EHLS.RPiDisplay35, pins: [dc: "j6:0", ...]}]`. 
 32 steps) for checking the gamma; it runs on any SoC with `:lcd`.
 
 `sim/`: simulations of the engine and its clients with a model of the panel
-(`python3 sim/test_engine.py`, `test_clients.py`; migen and LiteX).
+(`python3 sim/test_engine.py`, `test_clients.py`, `test_stalls.py`: the sinks when their instance waits or
+stops; migen and LiteX).
 
 From usb-rtl-sdr-tang25k (driver) and usb-rtl-sdr-tv (gamma).
 
